@@ -68,18 +68,28 @@ std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext )
 	return temp;
 }
 
+void ErrorExit ( HWND owner, unsigned exitCode )
+{
+	TaskDialog ( owner, nullptr, TEXT ( "오류" ), TEXT ( "오류가 발생했습니다." ), 
+		TEXT ( "Windows가 N 또는 KN 에디션이거나, 미디어 기능 팩이 설치되어 있지 않거나, 동영상 파일이 잘못된 것으로 보입니다." ), 
+		TDCBF_OK_BUTTON, TD_ERROR_ICON, nullptr );
+
+	ExitProcess ( exitCode );
+}
+
 DWORD WINAPI DoSushi ( LPVOID )
 {
-	MFStartup ( MF_VERSION );
+	if ( FAILED ( MFStartup ( MF_VERSION ) ) )
+		ErrorExit ( nullptr, -5 );
 
 	CComPtr<IWICImagingFactory> imagingFactory;
 	if ( FAILED ( CoCreateInstance ( CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
 		IID_IWICImagingFactory, ( LPVOID* ) &imagingFactory ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 
 	CComPtr<IMFAttributes> attribute;
 	if ( FAILED ( MFCreateAttributes ( &attribute, 0 ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 
 	attribute->SetUINT32 ( MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1 );
 	attribute->SetUINT32 ( MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE );
@@ -88,28 +98,28 @@ DWORD WINAPI DoSushi ( LPVOID )
 
 	HRESULT hr;
 	if ( FAILED ( hr = MFCreateSourceReaderFromURL ( g_openedVideoFile.c_str (), attribute, &sourceReader ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 
 	DWORD target, temp1; LONGLONG temp2; IMFSample * temp3;
 	if ( FAILED ( sourceReader->ReadSample ( MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_CONTROLF_DRAIN, &target, &temp1, &temp2, &temp3 ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 	DWORD readerVideoStreamIndex = target;
 
 	CComPtr<IMFMediaType> videoMediaType, decoderMediaType;
 	if ( FAILED ( sourceReader->GetNativeMediaType ( readerVideoStreamIndex, 0, &videoMediaType ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 	decoderMediaType = CreateInputMediaType ( videoMediaType );
 	if ( FAILED ( sourceReader->SetCurrentMediaType ( readerVideoStreamIndex, nullptr, decoderMediaType ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 
 	UINT width, height;
 	if ( FAILED ( MFGetAttributeSize ( videoMediaType, MF_MT_FRAME_SIZE, &width, &height ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 	UINT stride = ( width * 24 + 7 ) / 8;
 
 	PROPVARIANT var;
 	if ( FAILED ( sourceReader->GetPresentationAttribute ( MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var ) ) )
-		ExitProcess ( -5 );
+		ErrorExit ( nullptr, -5 );
 
 	LONGLONG duration;
 	PropVariantToInt64 ( var, &duration );
@@ -144,7 +154,7 @@ DWORD WINAPI DoSushi ( LPVOID )
 		if ( FAILED ( imagingFactory->CreateEncoder (
 			g_saveFileFormat == SFF_PNG ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg,
 			nullptr, &encoder ) ) )
-			ExitProcess ( -6 );
+			ErrorExit ( nullptr, -6 );
 
 		CComPtr<IStream> outputStream;
 		std::wstring filename = ConvertTimeStamp ( readedTimeStamp, g_saveFileFormat == SFF_PNG ? TEXT ( "png" ) : TEXT ( "jpg" ) );
@@ -154,12 +164,12 @@ DWORD WINAPI DoSushi ( LPVOID )
 			continue;
 
 		if ( FAILED ( encoder->Initialize ( outputStream, WICBitmapEncoderNoCache ) ) )
-			ExitProcess ( -6 );
+			ErrorExit ( nullptr, -6 );
 
 		CComPtr<IWICBitmapFrameEncode> frameEncode;
 		CComPtr<IPropertyBag2> encoderOptions;
 		if ( FAILED ( encoder->CreateNewFrame ( &frameEncode, &encoderOptions ) ) )
-			ExitProcess ( -6 );
+			ErrorExit ( nullptr, -6 );
 
 		PROPBAG2 propBag2 = { 0 };
 		VARIANT variant;
@@ -193,7 +203,7 @@ DWORD WINAPI DoSushi ( LPVOID )
 		}
 
 		if ( FAILED ( frameEncode->Initialize ( encoderOptions ) ) )
-			ExitProcess ( -6 );
+			ErrorExit ( nullptr, -6 );
 
 		WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
 		frameEncode->SetPixelFormat ( &pixelFormat );
@@ -273,7 +283,7 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 						CComPtr<IFileOpenDialog> dialog;
 						if ( FAILED ( CoCreateInstance ( CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
 							IID_IFileOpenDialog, ( void ** ) &dialog ) ) )
-							ExitProcess ( -3 );
+							ErrorExit ( nullptr, -3 );
 
 						COMDLG_FILTERSPEC fileTypes [] =
 						{
@@ -288,11 +298,11 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 
 						IShellItem * selectedItem;
 						if ( FAILED ( dialog->GetResult ( &selectedItem ) ) )
-							ExitProcess ( -4 );
+							ErrorExit ( nullptr, -4 );
 
 						PWSTR filePath;
 						if ( FAILED ( selectedItem->GetDisplayName ( SIGDN_FILESYSPATH, &filePath ) ) )
-							ExitProcess ( -4 );
+							ErrorExit ( nullptr, -4 );
 						::g_openedVideoFile = filePath;
 						CoTaskMemFree ( filePath );
 
@@ -306,7 +316,7 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 						CComPtr<IFileOpenDialog> dialog;
 						if ( FAILED ( CoCreateInstance ( CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
 							IID_IFileOpenDialog, ( void ** ) &dialog ) ) )
-							ExitProcess ( -3 );
+							ErrorExit ( nullptr, -3 );
 
 						dialog->SetOptions ( FOS_PATHMUSTEXIST | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_NOTESTFILECREATE );
 
@@ -315,11 +325,11 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 
 						IShellItem * selectedItem;
 						if ( FAILED ( dialog->GetResult ( &selectedItem ) ) )
-							ExitProcess ( -4 );
+							ErrorExit ( nullptr, -4 );
 
 						PWSTR filePath;
 						if ( FAILED ( selectedItem->GetDisplayName ( SIGDN_FILESYSPATH, &filePath ) ) )
-							ExitProcess ( -4 );
+							ErrorExit ( nullptr, -4 );
 						::g_saveTo = filePath;
 						CoTaskMemFree ( filePath );
 
