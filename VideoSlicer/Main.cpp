@@ -18,14 +18,6 @@
 
 #include "Resources/resource.h"
 
-#if defined _M_IX86
-#pragma comment ( linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='x86' publicKeyToken='6595b64144ccf1df' language='*'\"" )
-#elif defined _M_X64
-#pragma comment ( linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"" )
-#else
-#pragma comment ( linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"" )
-#endif
-
 #pragma comment ( lib, "comctl32.lib" )
 #pragma comment ( lib, "mfplat.lib" )
 #pragma comment ( lib, "mfuuid.lib" )
@@ -57,6 +49,23 @@ IMFMediaType * CreateInputMediaType ( IMFMediaType * inputMediaType )
 	ret->SetGUID ( MF_MT_MAJOR_TYPE, MFMediaType_Video );
 	ret->SetGUID ( MF_MT_SUBTYPE, MFVideoFormat_RGB24 );
 	return ret.Detach ();
+}
+
+std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext )
+{
+	UINT millisec = ( UINT ) ( nanosec / 10000 );
+
+	UINT hour = millisec / 1000 / 60 / 60;
+	millisec -= hour * 1000 * 60 * 60;
+	UINT minute = millisec / 1000 / 60;
+	millisec -= minute * 1000 * 60;
+	UINT second = millisec / 1000;
+	millisec -= second * 1000;
+
+	wchar_t temp [ 256 ];
+	wsprintf ( temp, TEXT ( "%02d：%02d：%02d．%03d.%s" ), hour, minute, second, millisec, ext );
+
+	return temp;
 }
 
 DWORD WINAPI DoSushi ( LPVOID )
@@ -138,11 +147,9 @@ DWORD WINAPI DoSushi ( LPVOID )
 			ExitProcess ( -6 );
 
 		CComPtr<IStream> outputStream;
-		wchar_t filename [ MAX_PATH ];
-		_itow ( ( int ) ( readedTimeStamp / 100000 ), filename, 10 );
-		wcscat ( filename, g_saveFileFormat == SFF_PNG ? TEXT ( ".png" ) : TEXT ( ".jpg" ) );
+		std::wstring filename = ConvertTimeStamp ( readedTimeStamp, g_saveFileFormat == SFF_PNG ? TEXT ( "png" ) : TEXT ( "jpg" ) );
 		wchar_t outputPath [ MAX_PATH ];
-		PathCombine ( outputPath, g_saveTo.c_str (), filename );
+		PathCombine ( outputPath, g_saveTo.c_str (), filename.c_str () );
 		if ( FAILED ( SHCreateStreamOnFile ( outputPath, STGM_WRITE | STGM_CREATE, &outputStream ) ) )
 			continue;
 
@@ -241,6 +248,7 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 	mainConfig.pszWindowTitle = TEXT ( "영상 회뜨는 프로그램" );
 	mainConfig.pszMainInstruction = TEXT ( "영상 회 떠드립니다." );
 	mainConfig.pszContent = TEXT ( "지정된 경로에 선택한 동영상을 회떠서 프레임 하나하나 이미지 파일로 정성스럽게 저장해드립니다. 확인 버튼을 누르면 회 뜨기가 시작됩니다." );
+	mainConfig.pszFooter = TEXT ( "이 프로그램은 Windows N/KN 에디션에서는 동작하지 않습니다. KN 및 N 에디션에서 구동하려면 아래 링크에서 소프트웨어를 설치해주세요.\n<A HREF=\"https://www.microsoft.com/ko-kr/download/details.aspx?id=16546\">Windows 7용 미디어 기능 팩</A>\n<A HREF=\"https://www.microsoft.com/ko-kr/download/details.aspx?id=40744\">Windows 8.1용 미디어 기능 팩</A>\n<A HREF=\"https://www.microsoft.com/ko-kr/download/details.aspx?id=48231\">Windows 10용 미디어 기능 팩</A>" );
 	mainConfig.pButtons = buttonArray;
 	mainConfig.cButtons = _countof ( buttonArray );
 	mainConfig.pRadioButtons = radioButtonArray;
@@ -354,6 +362,13 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 			case TDN_RADIO_BUTTON_CLICKED:
 				{
 					::g_saveFileFormat = ( SAVEFILEFORMAT ) wParam;
+				}
+				break;
+
+			case TDN_HYPERLINK_CLICKED:
+				{
+					ShellExecute ( nullptr, TEXT ( "open" ), ( LPWSTR ) lParam,
+						nullptr, nullptr, SW_SHOW );
 				}
 				break;
 
