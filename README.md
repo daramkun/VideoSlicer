@@ -1,0 +1,2 @@
+# VideoSlicer
+Video slicing application
