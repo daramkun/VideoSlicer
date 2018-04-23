@@ -1,4 +1,11 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
+
+#ifdef _DEBUG
+#	define _CRTDBG_MAP_ALLOC
+#	include <cstdlib>
+#	include <crtdbg.h>
+#endif
+
 #include <string>
 
 #include <Windows.h>
@@ -18,6 +25,8 @@
 
 #include "Resources/resource.h"
 
+#include "ThreadPool.h"
+
 #pragma comment ( lib, "comctl32.lib" )
 #pragma comment ( lib, "mfplat.lib" )
 #pragma comment ( lib, "mfuuid.lib" )
@@ -28,7 +37,9 @@
 enum SAVEFILEFORMAT
 {
 	SFF_PNG = 201,
-	SFF_JPEG = 202,
+	SFF_JPEG_100 = 202,
+	SFF_JPEG_80 = 203,
+	SFF_JPEG_60 = 204,
 };
 
 std::wstring g_openedVideoFile;
@@ -40,9 +51,9 @@ double g_progress;
 HANDLE g_thread;
 DWORD g_threadId;
 
-SAVEFILEFORMAT g_saveFileFormat = SFF_JPEG;
+SAVEFILEFORMAT g_saveFileFormat = SFF_JPEG_100;
 
-IMFMediaType * CreateInputMediaType ( IMFMediaType * inputMediaType )
+IMFMediaType * CreateInputMediaType ( IMFMediaType * inputMediaType ) noexcept
 {
 	CComPtr<IMFMediaType> ret;
 	if ( FAILED ( MFCreateMediaType ( &ret ) ) ) return nullptr;
@@ -51,7 +62,7 @@ IMFMediaType * CreateInputMediaType ( IMFMediaType * inputMediaType )
 	return ret.Detach ();
 }
 
-std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext )
+std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext ) noexcept
 {
 	UINT millisec = ( UINT ) ( nanosec / 10000 );
 
@@ -71,16 +82,156 @@ std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext )
 void ErrorExit ( HWND owner, unsigned exitCode )
 {
 	TaskDialog ( owner, nullptr, TEXT ( "오류" ), TEXT ( "오류가 발생했습니다." ), 
-		TEXT ( "Windows가 N 또는 KN 에디션이거나, 미디어 기능 팩이 설치되어 있지 않거나, 동영상 파일이 잘못된 것으로 보입니다." ), 
+		TEXT ( "Windows가 N 또는 KN 에디션이면서 미디어 기능 팩이 설치되어 있지 않거나, 동영상 파일이 잘못된 것으로 보입니다." ), 
 		TDCBF_OK_BUTTON, TD_ERROR_ICON, nullptr );
 
 	ExitProcess ( exitCode );
 }
 
-DWORD WINAPI DoSushi ( LPVOID )
+class MediaFoundation
 {
-	if ( FAILED ( MFStartup ( MF_VERSION ) ) )
-		ErrorExit ( nullptr, -5 );
+public:
+	MediaFoundation ()
+	{
+		if ( FAILED ( MFStartup ( MF_VERSION ) ) )
+			ErrorExit ( nullptr, -5 );
+	}
+	~MediaFoundation () { MFShutdown (); }
+};
+
+bool EncodingImageToFile ( IMFSample * readedSample, LONGLONG readedTimeStamp,
+	IWICImagingFactory * imagingFactory, UINT width, UINT height, UINT stride ) noexcept
+{
+	CComPtr<IMFSample> autoReleaseSample;
+	*&autoReleaseSample = readedSample;
+
+	CComPtr<IMFMediaBuffer> buffer;
+	if ( FAILED ( readedSample->ConvertToContiguousBuffer ( &buffer ) ) )
+		return false;
+
+	BYTE * colorBuffer;
+	DWORD colorBufferMaxLength, colorBufferLength;
+	if ( FAILED ( buffer->Lock ( &colorBuffer, &colorBufferMaxLength, &colorBufferLength ) ) )
+		return false;
+
+	CComPtr<IWICBitmapEncoder> encoder;
+	if ( FAILED ( imagingFactory->CreateEncoder (
+		g_saveFileFormat == SFF_PNG ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg,
+		nullptr, &encoder ) ) )
+	{
+		buffer->Unlock ();
+		ErrorExit ( nullptr, -6 );
+		return false;
+	}
+
+	CComPtr<IStream> outputStream;
+	std::wstring filename = ConvertTimeStamp ( readedTimeStamp, g_saveFileFormat == SFF_PNG ? TEXT ( "png" ) : TEXT ( "jpg" ) );
+	wchar_t outputPath [ MAX_PATH ];
+	PathCombine ( outputPath, g_saveTo.c_str (), filename.c_str () );
+	if ( FAILED ( SHCreateStreamOnFile ( outputPath, STGM_WRITE | STGM_CREATE, &outputStream ) ) )
+	{
+		buffer->Unlock ();
+		return false;
+	}
+
+	if ( FAILED ( encoder->Initialize ( outputStream, WICBitmapEncoderNoCache ) ) )
+	{
+		buffer->Unlock ();
+		ErrorExit ( nullptr, -6 );
+		return false;
+	}
+
+	CComPtr<IWICBitmapFrameEncode> frameEncode;
+	CComPtr<IPropertyBag2> encoderOptions;
+	if ( FAILED ( encoder->CreateNewFrame ( &frameEncode, &encoderOptions ) ) )
+	{
+		buffer->Unlock ();
+		ErrorExit ( nullptr, -6 );
+		return false;
+	}
+
+	PROPBAG2 propBag2 = { 0 };
+	VARIANT variant;
+	if ( g_saveFileFormat == SFF_PNG )
+	{
+		propBag2.pstrName = ( LPOLESTR ) L"InterlaceOption";
+		VariantInit ( &variant );
+		variant.vt = VT_BOOL;
+		variant.boolVal = VARIANT_FALSE;
+		encoderOptions->Write ( 0, &propBag2, &variant );
+
+		propBag2.pstrName = ( LPOLESTR ) L"FilterOption";
+		VariantInit ( &variant );
+		variant.vt = VT_UI1;
+		variant.bVal = WICPngFilterAdaptive;
+		encoderOptions->Write ( 1, &propBag2, &variant );
+	}
+	else if ( g_saveFileFormat == SFF_JPEG_100 )
+	{
+		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
+		VariantInit ( &variant );
+		variant.vt = VT_R4;
+		variant.fltVal = 1.0f;
+		encoderOptions->Write ( 0, &propBag2, &variant );
+
+		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
+		VariantInit ( &variant );
+		variant.vt = VT_UI1;
+		variant.bVal = WICJpegYCrCbSubsampling444;
+		encoderOptions->Write ( 1, &propBag2, &variant );
+	}
+	else if ( g_saveFileFormat == SFF_JPEG_80 )
+	{
+		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
+		VariantInit ( &variant );
+		variant.vt = VT_R4;
+		variant.fltVal = 0.8f;
+		encoderOptions->Write ( 0, &propBag2, &variant );
+
+		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
+		VariantInit ( &variant );
+		variant.vt = VT_UI1;
+		variant.bVal = WICJpegYCrCbSubsampling422;
+		encoderOptions->Write ( 1, &propBag2, &variant );
+	}
+	else if ( g_saveFileFormat == SFF_JPEG_60 )
+	{
+		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
+		VariantInit ( &variant );
+		variant.vt = VT_R4;
+		variant.fltVal = 0.6f;
+		encoderOptions->Write ( 0, &propBag2, &variant );
+
+		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
+		VariantInit ( &variant );
+		variant.vt = VT_UI1;
+		variant.bVal = WICJpegYCrCbSubsampling420;
+		encoderOptions->Write ( 1, &propBag2, &variant );
+	}
+
+	if ( FAILED ( frameEncode->Initialize ( encoderOptions ) ) )
+	{
+		buffer->Unlock ();
+		ErrorExit ( nullptr, -6 );
+		return false;
+	}
+
+	WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
+	frameEncode->SetPixelFormat ( &pixelFormat );
+	frameEncode->SetSize ( width, height );
+	frameEncode->WritePixels ( height, stride, colorBufferLength, colorBuffer );
+
+	frameEncode->Commit ();
+	encoder->Commit ();
+
+	buffer->Unlock ();
+
+	return true;
+}
+
+DWORD WINAPI DoSushi ( LPVOID ) noexcept
+{
+	MediaFoundation mediaFoundation;
 
 	CComPtr<IWICImagingFactory> imagingFactory;
 	if ( FAILED ( CoCreateInstance ( CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -91,7 +242,7 @@ DWORD WINAPI DoSushi ( LPVOID )
 	if ( FAILED ( MFCreateAttributes ( &attribute, 0 ) ) )
 		ErrorExit ( nullptr, -5 );
 
-	attribute->SetUINT32 ( MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1 );
+	attribute->SetUINT32 ( MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE );
 	attribute->SetUINT32 ( MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE );
 
 	CComPtr<IMFSourceReader> sourceReader;
@@ -124,101 +275,41 @@ DWORD WINAPI DoSushi ( LPVOID )
 	LONGLONG duration;
 	PropVariantToInt64 ( var, &duration );
 	PropVariantClear ( &var );
-
+	
 	g_progress = 0;
 	g_isStarted = true;
 
-	while ( true )
 	{
-		DWORD actualStreamIndex, streamFlags;
-		LONGLONG readedTimeStamp = 0;
-		CComPtr<IMFSample> readedSample;
+		ThreadPool threadPool ( std::thread::hardware_concurrency () / 3 * 2 );
 
-		if ( FAILED ( sourceReader->ReadSample ( MF_SOURCE_READER_FIRST_VIDEO_STREAM, 
-			0, &actualStreamIndex, &streamFlags, &readedTimeStamp, &readedSample ) ) )
-			continue;
-
-		if ( MF_SOURCE_READERF_ENDOFSTREAM == streamFlags && nullptr == readedSample )
-			break;
-
-		CComPtr<IMFMediaBuffer> buffer;
-		if ( FAILED ( readedSample->ConvertToContiguousBuffer ( &buffer ) ) )
-			continue;
-
-		BYTE * colorBuffer;
-		DWORD colorBufferMaxLength, colorBufferLength;
-		if ( FAILED ( buffer->Lock ( &colorBuffer, &colorBufferMaxLength, &colorBufferLength ) ) )
-			continue;
-
-		CComPtr<IWICBitmapEncoder> encoder;
-		if ( FAILED ( imagingFactory->CreateEncoder (
-			g_saveFileFormat == SFF_PNG ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg,
-			nullptr, &encoder ) ) )
-			ErrorExit ( nullptr, -6 );
-
-		CComPtr<IStream> outputStream;
-		std::wstring filename = ConvertTimeStamp ( readedTimeStamp, g_saveFileFormat == SFF_PNG ? TEXT ( "png" ) : TEXT ( "jpg" ) );
-		wchar_t outputPath [ MAX_PATH ];
-		PathCombine ( outputPath, g_saveTo.c_str (), filename.c_str () );
-		if ( FAILED ( SHCreateStreamOnFile ( outputPath, STGM_WRITE | STGM_CREATE, &outputStream ) ) )
-			continue;
-
-		if ( FAILED ( encoder->Initialize ( outputStream, WICBitmapEncoderNoCache ) ) )
-			ErrorExit ( nullptr, -6 );
-
-		CComPtr<IWICBitmapFrameEncode> frameEncode;
-		CComPtr<IPropertyBag2> encoderOptions;
-		if ( FAILED ( encoder->CreateNewFrame ( &frameEncode, &encoderOptions ) ) )
-			ErrorExit ( nullptr, -6 );
-
-		PROPBAG2 propBag2 = { 0 };
-		VARIANT variant;
-		if ( g_saveFileFormat == SFF_PNG )
+		while ( g_isStarted )
 		{
-			propBag2.pstrName = ( LPOLESTR ) L"InterlaceOption";
-			VariantInit ( &variant );
-			variant.vt = VT_BOOL;
-			variant.boolVal = VARIANT_FALSE;
-			encoderOptions->Write ( 0, &propBag2, &variant );
+			if ( threadPool.taskSize () >= std::thread::hardware_concurrency () * 2 )
+			{
+				Sleep ( 1 );
+				continue;
+			}
 
-			propBag2.pstrName = ( LPOLESTR ) L"FilterOption";
-			VariantInit ( &variant );
-			variant.vt = VT_UI1;
-			variant.bVal = WICPngFilterAdaptive;
-			encoderOptions->Write ( 1, &propBag2, &variant );
+			DWORD actualStreamIndex, streamFlags;
+			LONGLONG readedTimeStamp = 0;
+			CComPtr<IMFSample> readedSample;
+
+			if ( FAILED ( sourceReader->ReadSample ( MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+				0, &actualStreamIndex, &streamFlags, &readedTimeStamp, &readedSample ) ) )
+				continue;
+
+			if ( MF_SOURCE_READERF_ENDOFSTREAM == streamFlags && nullptr == readedSample )
+				break;
+
+			//EncodingImageToFile ( readedSample.Detach (), readedTimeStamp,
+			//	imagingFactory, width, height, stride );
+			auto result = threadPool.enqueue ( EncodingImageToFile,
+				readedSample.Detach (), readedTimeStamp,
+				imagingFactory, width, height, stride );
+			
+			g_progress = readedTimeStamp / ( double ) duration;
 		}
-		else if ( g_saveFileFormat == SFF_JPEG )
-		{
-			propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
-			VariantInit ( &variant );
-			variant.vt = VT_R4;
-			variant.fltVal = 0.8f;
-			encoderOptions->Write ( 0, &propBag2, &variant );
-
-			propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
-			VariantInit ( &variant );
-			variant.vt = VT_UI1;
-			variant.bVal = WICJpegYCrCbSubsampling420;
-			encoderOptions->Write ( 0, &propBag2, &variant );
-		}
-
-		if ( FAILED ( frameEncode->Initialize ( encoderOptions ) ) )
-			ErrorExit ( nullptr, -6 );
-
-		WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
-		frameEncode->SetPixelFormat ( &pixelFormat );
-		frameEncode->SetSize ( width, height );
-		frameEncode->WritePixels ( height, stride, colorBufferLength, colorBuffer );
-
-		frameEncode->Commit ();
-		encoder->Commit ();
-
-		buffer->Unlock ();
-
-		g_progress = readedTimeStamp / ( double ) duration;
 	}
-
-	MFShutdown ();
 
 	g_progress = 1;
 
@@ -227,6 +318,10 @@ DWORD WINAPI DoSushi ( LPVOID )
 
 int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 {
+#ifdef _DEBUG
+	_CrtSetDbgFlag ( _CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF );
+#endif
+
 	if ( !IsWindows7OrGreater () )
 	{
 		MessageBox ( nullptr, TEXT ( "이 프로그램은 Windows 7 이상만 대응하고 있습니다." ),
@@ -234,7 +329,7 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 		return -1;
 	}
 
-	if ( FAILED ( CoInitialize ( nullptr ) ) )
+	if ( FAILED ( CoInitializeEx ( nullptr, COINIT_APARTMENTTHREADED ) ) )
 		return -1;
 
 	HICON hIcon = LoadIcon ( hInstance, MAKEINTRESOURCE ( IDI_MAIN_ICON ) );
@@ -247,7 +342,9 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 	TASKDIALOG_BUTTON radioButtonArray [] =
 	{
 		{ 201, TEXT ( "PNG로 저장하기" ) },
-		{ 202, TEXT ( "JPEG로 저장하기" ) },
+		{ 202, TEXT ( "JPEG로 저장하기(100% 화질)" ) },
+		{ 203, TEXT ( "JPEG로 저장하기(80% 화질)" ) },
+		{ 204, TEXT ( "JPEG로 저장하기(60% 화질)" ) },
 	};
 
 	TASKDIALOGCONFIG mainConfig = { 0, };
@@ -302,7 +399,10 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 
 						PWSTR filePath;
 						if ( FAILED ( selectedItem->GetDisplayName ( SIGDN_FILESYSPATH, &filePath ) ) )
+						{
 							ErrorExit ( nullptr, -4 );
+							return 0;
+						}
 						::g_openedVideoFile = filePath;
 						CoTaskMemFree ( filePath );
 
@@ -329,7 +429,10 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 
 						PWSTR filePath;
 						if ( FAILED ( selectedItem->GetDisplayName ( SIGDN_FILESYSPATH, &filePath ) ) )
+						{
 							ErrorExit ( nullptr, -4 );
+							return 0;
+						}
 						::g_saveTo = filePath;
 						CoTaskMemFree ( filePath );
 
@@ -364,7 +467,10 @@ int WINAPI WinMain ( HINSTANCE hInstance, HINSTANCE, LPSTR, int )
 							return 1;
 
 						if ( ::g_thread != NULL )
-							TerminateThread ( g_thread, 0 );
+						{
+							g_isStarted = false;
+							WaitForSingleObject ( g_thread, INFINITE );
+						}
 					}
 				}
 				break;
