@@ -12,27 +12,16 @@
 #include <CommCtrl.h>
 #include <ShlObj.h>
 #include <atlbase.h>
-#include <Propvarutil.h>
-#include <Wincodec.h>
 
 #include <VersionHelpers.h>
 
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
-#include <mfplay.h>
-#include <mftransform.h>
-
 #include "Resources/resource.h"
 
+#include "Video/VideoDecoder.h"
+#include "Image/ImageEncoder.h"
 #include "ThreadPool.h"
 
 #pragma comment ( lib, "comctl32.lib" )
-#pragma comment ( lib, "mfplat.lib" )
-#pragma comment ( lib, "mfuuid.lib" )
-#pragma comment ( lib, "mfreadwrite.lib" )
-#pragma comment ( lib, "Propsys.lib" )
-#pragma comment ( lib, "windowscodecs.lib" )
 
 enum SAVEFILEFORMAT
 {
@@ -53,15 +42,6 @@ DWORD g_threadId;
 
 SAVEFILEFORMAT g_saveFileFormat = SFF_JPEG_100;
 
-IMFMediaType * CreateInputMediaType ( IMFMediaType * inputMediaType ) noexcept
-{
-	CComPtr<IMFMediaType> ret;
-	if ( FAILED ( MFCreateMediaType ( &ret ) ) ) return nullptr;
-	ret->SetGUID ( MF_MT_MAJOR_TYPE, MFMediaType_Video );
-	ret->SetGUID ( MF_MT_SUBTYPE, MFVideoFormat_RGB24 );
-	return ret.Detach ();
-}
-
 std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext ) noexcept
 {
 	UINT millisec = ( UINT ) ( nanosec / 10000 );
@@ -74,7 +54,7 @@ std::wstring ConvertTimeStamp ( LONGLONG nanosec, LPCWSTR ext ) noexcept
 	millisec -= second * 1000;
 
 	wchar_t temp [ 256 ];
-	wsprintf ( temp, TEXT ( "%02d：%02d：%02d．%03d.%s" ), hour, minute, second, millisec, ext );
+	wsprintf ( temp, TEXT ( "%02dː%02dː%02d˙%03d.%s" ), hour, minute, second, millisec, ext );
 
 	return temp;
 }
@@ -88,226 +68,120 @@ void ErrorExit ( HWND owner, unsigned exitCode )
 	ExitProcess ( exitCode );
 }
 
-class MediaFoundation
+bool EncodingImageToFile ( IVideoSample * readedSample, LONGLONG readedTimeStamp,
+	UINT width, UINT height, UINT stride ) noexcept
 {
-public:
-	MediaFoundation ()
-	{
-		if ( FAILED ( MFStartup ( MF_VERSION ) ) )
-			ErrorExit ( nullptr, -5 );
-	}
-	~MediaFoundation () { MFShutdown (); }
-};
-
-bool EncodingImageToFile ( IMFSample * readedSample, LONGLONG readedTimeStamp,
-	IWICImagingFactory * imagingFactory, UINT width, UINT height, UINT stride ) noexcept
-{
-	CComPtr<IMFSample> autoReleaseSample;
-	*&autoReleaseSample = readedSample;
-
-	CComPtr<IMFMediaBuffer> buffer;
-	if ( FAILED ( readedSample->ConvertToContiguousBuffer ( &buffer ) ) )
-		return false;
+	CComPtr<IVideoSample> sample;
+	*&sample = readedSample;
 
 	BYTE * colorBuffer;
-	DWORD colorBufferMaxLength, colorBufferLength;
-	if ( FAILED ( buffer->Lock ( &colorBuffer, &colorBufferMaxLength, &colorBufferLength ) ) )
+	uint64_t colorBufferLength;
+	if ( FAILED ( sample->Lock ( ( LPVOID* ) &colorBuffer, &colorBufferLength ) ) )
 		return false;
 
-	CComPtr<IWICBitmapEncoder> encoder;
-	if ( FAILED ( imagingFactory->CreateEncoder (
-		g_saveFileFormat == SFF_PNG ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg,
-		nullptr, &encoder ) ) )
-	{
-		buffer->Unlock ();
-		ErrorExit ( nullptr, -6 );
-		return false;
-	}
-
-	CComPtr<IStream> outputStream;
 	std::wstring filename = ConvertTimeStamp ( readedTimeStamp, g_saveFileFormat == SFF_PNG ? TEXT ( "png" ) : TEXT ( "jpg" ) );
 	wchar_t outputPath [ MAX_PATH ];
 	PathCombine ( outputPath, g_saveTo.c_str (), filename.c_str () );
-	if ( FAILED ( SHCreateStreamOnFile ( outputPath, STGM_WRITE | STGM_CREATE, &outputStream ) ) )
+	
+	ImageEncoderSettings settings;
+	switch ( g_saveFileFormat )
 	{
-		buffer->Unlock ();
+		case SFF_PNG:
+			settings.codecType = IEC_PNG;
+			settings.settings.png.interlace = false;
+			settings.settings.png.filtering = true;
+			break;
+
+		case SFF_JPEG_100:
+			settings.codecType = IEC_JPEG;
+			settings.settings.jpeg.quality = 1.0f;
+			settings.settings.jpeg.chromaSubsample = false;
+			break;
+
+		case SFF_JPEG_80:
+			settings.codecType = IEC_JPEG;
+			settings.settings.jpeg.quality = 0.8f;
+			settings.settings.jpeg.chromaSubsample = true;
+			break;
+		case SFF_JPEG_60:
+			settings.codecType = IEC_JPEG;
+			settings.settings.jpeg.quality = 0.6f;
+			settings.settings.jpeg.chromaSubsample = true;
+			break;
+	}
+	settings.imageProp.width = width;
+	settings.imageProp.height = height;
+	settings.imageProp.stride = stride;
+
+	if ( FAILED ( SaveImage ( outputPath, &settings, colorBuffer, colorBufferLength ) ) )
+	{
+		sample->Unlock ();
 		return false;
 	}
 
-	if ( FAILED ( encoder->Initialize ( outputStream, WICBitmapEncoderNoCache ) ) )
-	{
-		buffer->Unlock ();
-		ErrorExit ( nullptr, -6 );
-		return false;
-	}
-
-	CComPtr<IWICBitmapFrameEncode> frameEncode;
-	CComPtr<IPropertyBag2> encoderOptions;
-	if ( FAILED ( encoder->CreateNewFrame ( &frameEncode, &encoderOptions ) ) )
-	{
-		buffer->Unlock ();
-		ErrorExit ( nullptr, -6 );
-		return false;
-	}
-
-	PROPBAG2 propBag2 = { 0 };
-	VARIANT variant;
-	if ( g_saveFileFormat == SFF_PNG )
-	{
-		propBag2.pstrName = ( LPOLESTR ) L"InterlaceOption";
-		VariantInit ( &variant );
-		variant.vt = VT_BOOL;
-		variant.boolVal = VARIANT_FALSE;
-		encoderOptions->Write ( 0, &propBag2, &variant );
-
-		propBag2.pstrName = ( LPOLESTR ) L"FilterOption";
-		VariantInit ( &variant );
-		variant.vt = VT_UI1;
-		variant.bVal = WICPngFilterAdaptive;
-		encoderOptions->Write ( 1, &propBag2, &variant );
-	}
-	else if ( g_saveFileFormat == SFF_JPEG_100 )
-	{
-		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
-		VariantInit ( &variant );
-		variant.vt = VT_R4;
-		variant.fltVal = 1.0f;
-		encoderOptions->Write ( 0, &propBag2, &variant );
-
-		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
-		VariantInit ( &variant );
-		variant.vt = VT_UI1;
-		variant.bVal = WICJpegYCrCbSubsampling444;
-		encoderOptions->Write ( 1, &propBag2, &variant );
-	}
-	else if ( g_saveFileFormat == SFF_JPEG_80 )
-	{
-		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
-		VariantInit ( &variant );
-		variant.vt = VT_R4;
-		variant.fltVal = 0.8f;
-		encoderOptions->Write ( 0, &propBag2, &variant );
-
-		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
-		VariantInit ( &variant );
-		variant.vt = VT_UI1;
-		variant.bVal = WICJpegYCrCbSubsampling422;
-		encoderOptions->Write ( 1, &propBag2, &variant );
-	}
-	else if ( g_saveFileFormat == SFF_JPEG_60 )
-	{
-		propBag2.pstrName = ( LPOLESTR ) L"ImageQuality";
-		VariantInit ( &variant );
-		variant.vt = VT_R4;
-		variant.fltVal = 0.6f;
-		encoderOptions->Write ( 0, &propBag2, &variant );
-
-		propBag2.pstrName = ( LPOLESTR ) L"JpegYCrCbSubsampling";
-		VariantInit ( &variant );
-		variant.vt = VT_UI1;
-		variant.bVal = WICJpegYCrCbSubsampling420;
-		encoderOptions->Write ( 1, &propBag2, &variant );
-	}
-
-	if ( FAILED ( frameEncode->Initialize ( encoderOptions ) ) )
-	{
-		buffer->Unlock ();
-		ErrorExit ( nullptr, -6 );
-		return false;
-	}
-
-	WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
-	frameEncode->SetPixelFormat ( &pixelFormat );
-	frameEncode->SetSize ( width, height );
-	frameEncode->WritePixels ( height, stride, colorBufferLength, colorBuffer );
-
-	frameEncode->Commit ();
-	encoder->Commit ();
-
-	buffer->Unlock ();
+	sample->Unlock ();
 
 	return true;
 }
 
 DWORD WINAPI DoSushi ( LPVOID ) noexcept
 {
-	MediaFoundation mediaFoundation;
-
-	CComPtr<IWICImagingFactory> imagingFactory;
-	if ( FAILED ( CoCreateInstance ( CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-		IID_IWICImagingFactory, ( LPVOID* ) &imagingFactory ) ) )
+	CComPtr<IVideoDecoder> videoDecoder;
+	//if ( FAILED ( CreateMediaFoundationVideoDecoder ( &videoDecoder ) ) )
+	if ( FAILED ( CreateFFmpegVideoDecoder ( &videoDecoder ) ) )
+	{
 		ErrorExit ( nullptr, -5 );
+		return -1;
+	}
 
-	CComPtr<IMFAttributes> attribute;
-	if ( FAILED ( MFCreateAttributes ( &attribute, 0 ) ) )
+	if ( FAILED ( videoDecoder->Initialize ( g_openedVideoFile.c_str () ) ) )
+	{
 		ErrorExit ( nullptr, -5 );
+		return -1;
+	}
 
-	attribute->SetUINT32 ( MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE );
-	attribute->SetUINT32 ( MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE );
-
-	CComPtr<IMFSourceReader> sourceReader;
-
-	HRESULT hr;
-	if ( FAILED ( hr = MFCreateSourceReaderFromURL ( g_openedVideoFile.c_str (), attribute, &sourceReader ) ) )
+	uint64_t duration;
+	if ( FAILED ( videoDecoder->GetDuration ( &duration ) ) )
+	{
 		ErrorExit ( nullptr, -5 );
+		return -1;
+	}
 
-	DWORD target, temp1; LONGLONG temp2; IMFSample * temp3;
-	if ( FAILED ( sourceReader->ReadSample ( MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_CONTROLF_DRAIN, &target, &temp1, &temp2, &temp3 ) ) )
+	uint32_t width, height, stride;
+	if ( FAILED ( videoDecoder->GetVideoSize ( &width, &height, &stride ) ) )
+	{
 		ErrorExit ( nullptr, -5 );
-	DWORD readerVideoStreamIndex = target;
-
-	CComPtr<IMFMediaType> videoMediaType, decoderMediaType;
-	if ( FAILED ( sourceReader->GetNativeMediaType ( readerVideoStreamIndex, 0, &videoMediaType ) ) )
-		ErrorExit ( nullptr, -5 );
-	decoderMediaType = CreateInputMediaType ( videoMediaType );
-	if ( FAILED ( sourceReader->SetCurrentMediaType ( readerVideoStreamIndex, nullptr, decoderMediaType ) ) )
-		ErrorExit ( nullptr, -5 );
-
-	UINT width, height;
-	if ( FAILED ( MFGetAttributeSize ( videoMediaType, MF_MT_FRAME_SIZE, &width, &height ) ) )
-		ErrorExit ( nullptr, -5 );
-	UINT stride = ( width * 24 + 7 ) / 8;
-
-	PROPVARIANT var;
-	if ( FAILED ( sourceReader->GetPresentationAttribute ( MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var ) ) )
-		ErrorExit ( nullptr, -5 );
-
-	LONGLONG duration;
-	PropVariantToInt64 ( var, &duration );
-	PropVariantClear ( &var );
+		return -1;
+	}
 	
 	g_progress = 0;
 	g_isStarted = true;
 
 	{
-		ThreadPool threadPool ( std::thread::hardware_concurrency () / 3 * 2 );
+		ThreadPool threadPool ( std::thread::hardware_concurrency () );
 
 		while ( g_isStarted )
 		{
-			if ( threadPool.taskSize () >= std::thread::hardware_concurrency () * 2 )
+			if ( threadPool.taskSize () >= std::thread::hardware_concurrency () * 4 )
 			{
 				Sleep ( 1 );
 				continue;
 			}
 
-			DWORD actualStreamIndex, streamFlags;
-			LONGLONG readedTimeStamp = 0;
-			CComPtr<IMFSample> readedSample;
+			uint64_t readedTimeStamp = 0;
+			CComPtr<IVideoSample> readedSample;
 
-			if ( FAILED ( sourceReader->ReadSample ( MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-				0, &actualStreamIndex, &streamFlags, &readedTimeStamp, &readedSample ) ) )
+			if ( FAILED ( videoDecoder->ReadSample ( &readedSample, &readedTimeStamp ) ) )
 				continue;
 
-			if ( MF_SOURCE_READERF_ENDOFSTREAM == streamFlags && nullptr == readedSample )
+			if ( nullptr == readedSample )
 				break;
 
-			//EncodingImageToFile ( readedSample.Detach (), readedTimeStamp,
-			//	imagingFactory, width, height, stride );
 			auto result = threadPool.enqueue ( EncodingImageToFile,
 				readedSample.Detach (), readedTimeStamp,
-				imagingFactory, width, height, stride );
+				width, height, stride );
 			
-			g_progress = readedTimeStamp / ( double ) duration;
+			g_progress = ( readedTimeStamp / 10000 ) / ( double ) ( duration / 10000 );
 		}
 	}
 
